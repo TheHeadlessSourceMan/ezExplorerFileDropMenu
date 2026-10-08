@@ -1,0 +1,4 @@
+LIBRARY SymbolicLinkExplorerContextMenu
+EXPORTS
+    DllCanUnloadNow
+    DllGetClassObject

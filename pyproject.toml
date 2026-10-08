@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symbolic-link-explorer-context-menu"
+version = "0.1.0"
+description = "Windows Explorer right-drag symbolic-link command."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["coverage"]
+dev = ["coverage", "pylint"]
+
+[project.scripts]
+symbolic-link-explorer-context-menu = "symbolic_link_explorer_context_menu.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["symbolic_link_explorer_context_menu"]
+
+[tool.coverage.run]
+branch = true
+source = ["symbolic_link_explorer_context_menu"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
