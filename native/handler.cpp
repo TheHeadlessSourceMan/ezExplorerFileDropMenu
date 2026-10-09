@@ -6,6 +6,8 @@
 #include <shlwapi.h>
 #include <cstring>
 #include <cwchar>
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -303,22 +305,98 @@ std::wstring Expand(const std::wstring& pattern, const std::vector<std::wstring>
     return result;
 }
 
-bool Launch(std::wstring command, const std::wstring& directory) {
+bool IsElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation = {};
+    DWORD size = 0;
+    bool result = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+    CloseHandle(token);
+    return result;
+}
+
+// Re-runs the command through the "runas" verb, which shows the UAC prompt.
+void RunElevated(const std::wstring& command, const std::wstring& directory) {
+    size_t split = 0;
+    std::wstring file;
+    if (!command.empty() && command[0] == L'"') {
+        size_t close = command.find(L'"', 1);
+        if (close == std::wstring::npos) return;
+        file = command.substr(1, close - 1);
+        split = close + 1;
+    } else {
+        split = command.find(L' ');
+        if (split == std::wstring::npos) split = command.size();
+        file = command.substr(0, split);
+    }
+    std::wstring parameters = command.substr(split);
+    SHELLEXECUTEINFOW info = {sizeof(info)};
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";
+    info.lpFile = file.c_str();
+    info.lpParameters = parameters.c_str();
+    info.lpDirectory = directory.empty() ? nullptr : directory.c_str();
+    info.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&info)) {
+        Log(L"elevated launch failed (" + std::to_wstring(GetLastError()) + L"): " + command);
+        return;
+    }
+    if (info.hProcess) CloseHandle(info.hProcess);
+}
+
+struct Job {
+    std::wstring command;
+    std::wstring directory;
+    HMODULE module;
+};
+
+DWORD WINAPI RunJob(LPVOID parameter) {
+    std::unique_ptr<Job> job(static_cast<Job*>(parameter));
+    bool initialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+    std::wstring mutable_command = job->command;
+    mutable_command.push_back(L'\0');
+    STARTUPINFOW startup = {sizeof(startup)};
+    PROCESS_INFORMATION process = {};
+    BOOL started = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+        job->directory.empty() ? nullptr : job->directory.c_str(), &startup, &process);
+    if (started) {
+        CloseHandle(process.hThread);
+        WaitForSingleObject(process.hProcess, INFINITE);
+        DWORD code = 0;
+        GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hProcess);
+        if (code != 0 && !IsElevated()) {
+            Log(L"command exited with " + std::to_wstring(code) + L", retrying elevated: " + job->command);
+            RunElevated(job->command, job->directory);
+        }
+    } else if (GetLastError() == ERROR_ELEVATION_REQUIRED) {
+        RunElevated(job->command, job->directory);
+    } else {
+        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + job->command);
+    }
+    if (initialized) CoUninitialize();
+    HMODULE module = job->module;
+    job.reset();
+    FreeLibraryAndExitThread(module, 0);
+}
+
+// Runs on a worker thread so Explorer is not blocked while waiting for the exit code.
+bool Launch(const std::wstring& command, const std::wstring& directory) {
     if (command.size() >= kMaxCommandLine) {
         Log(L"command line too long (" + std::to_wstring(command.size()) + L" characters): " + command.substr(0, 200));
         return false;
     }
-    STARTUPINFOW startup = {sizeof(startup)};
-    PROCESS_INFORMATION process = {};
-    command.push_back(L'\0');
-    BOOL started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-        directory.empty() ? nullptr : directory.c_str(), &startup, &process);
-    if (!started) {
-        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + command);
+    HMODULE module = nullptr;
+    // Pins the DLL so it stays loaded until the worker finishes.
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&RunJob), &module)) return false;
+    auto* job = new (std::nothrow) Job{command, directory, module};
+    HANDLE thread = job ? CreateThread(nullptr, 0, RunJob, job, 0, nullptr) : nullptr;
+    if (!thread) {
+        delete job;
+        FreeLibrary(module);
         return false;
     }
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
+    CloseHandle(thread);
     return true;
 }
 
