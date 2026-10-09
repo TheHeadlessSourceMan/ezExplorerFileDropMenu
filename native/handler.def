@@ -2,3 +2,6 @@ LIBRARY ezExplorerFileDropMenu
 EXPORTS
     DllCanUnloadNow
     DllGetClassObject
+    EzExpandCommandLine
+    ExpandW
+    RunW

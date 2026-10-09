@@ -76,6 +76,24 @@ Only filesystem drag data represented as `CF_HDROP` is accepted. Namespace-only 
 
 `menu.json` can run arbitrary commands as the current user; keep it writable only by you. The native handler runs in Explorer and must stay tiny: it performs no directory traversal or file operations. The native build must match Explorer's 64-bit process architecture.
 
+## Testing
+
+The DLL exports helpers that exercise command-line substitution and execution without Explorer. Arguments are `pattern|targetDir|file1|file2...`; results go to `%LOCALAPPDATA%\ezExplorerFileDropMenu\logs\handler.log`.
+
+```powershell
+$dll = "D:\path\to\ezExplorerFileDropMenu.dll"
+$arg = 'powershell -NoProfile -Command "$f=''{file}''; New-Item -ItemType SymbolicLink -Path (Join-Path ''{targetDir}'' (Split-Path -Leaf $f)) -Target $f"|C:\temp\target|C:\temp\src\a.txt|C:\temp\src\b.txt'
+Start-Process rundll32 -ArgumentList "`"$dll`",Expand $arg" -Wait   # log expanded command lines only
+Start-Process rundll32 -ArgumentList "`"$dll`",Run $arg" -Wait      # expand, execute, log exit codes
+Get-Content "$env:LOCALAPPDATA\ezExplorerFileDropMenu\logs\handler.log"
+```
+
+- Call the exports as `Expand` and `Run`, not `ExpandW`/`RunW`; `rundll32` appends the `W` itself to get a Unicode command line.
+- Pass the argument string as a single raw string (as `Start-Process` does above); calling `rundll32` directly from PowerShell mangles the embedded quotes.
+- `{file}` runs the command once per file; `{files}` runs it once with all files.
+- Expected: `Expand` logs the substituted command lines. `Run` additionally logs `executing:`, `command exited with N` and `Run: exit code N`.
+- `EzExpandCommandLine` is also exported for callers that load the DLL directly.
+
 ## Testing and release
 
 ```powershell

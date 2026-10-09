@@ -350,30 +350,40 @@ struct Job {
     HMODULE module;
 };
 
-DWORD WINAPI RunJob(LPVOID parameter) {
-    std::unique_ptr<Job> job(static_cast<Job*>(parameter));
-    bool initialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
-    std::wstring mutable_command = job->command;
+// Synchronous; returns the process exit code, or -1 if it could not be started.
+int ExecuteCommand(const std::wstring& command, const std::wstring& directory) {
+    Log(L"executing: " + command + L" (cwd: " + directory + L")");
+    std::wstring mutable_command = command;
     mutable_command.push_back(L'\0');
     STARTUPINFOW startup = {sizeof(startup)};
     PROCESS_INFORMATION process = {};
     BOOL started = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-        job->directory.empty() ? nullptr : job->directory.c_str(), &startup, &process);
+        directory.empty() ? nullptr : directory.c_str(), &startup, &process);
+    int result = -1;
     if (started) {
         CloseHandle(process.hThread);
         WaitForSingleObject(process.hProcess, INFINITE);
         DWORD code = 0;
         GetExitCodeProcess(process.hProcess, &code);
         CloseHandle(process.hProcess);
+        result = static_cast<int>(code);
+        Log(L"command exited with " + std::to_wstring(code));
         if (code != 0 && !IsElevated()) {
-            Log(L"command exited with " + std::to_wstring(code) + L", retrying elevated: " + job->command);
-            RunElevated(job->command, job->directory);
+            Log(L"retrying elevated: " + command);
+            RunElevated(command, directory);
         }
     } else if (GetLastError() == ERROR_ELEVATION_REQUIRED) {
-        RunElevated(job->command, job->directory);
+        RunElevated(command, directory);
     } else {
-        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + job->command);
+        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + command);
     }
+    return result;
+}
+
+DWORD WINAPI RunJob(LPVOID parameter) {
+    std::unique_ptr<Job> job(static_cast<Job*>(parameter));
+    bool initialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+    ExecuteCommand(job->command, job->directory);
     if (initialized) CoUninitialize();
     HMODULE module = job->module;
     job.reset();
@@ -399,6 +409,8 @@ bool Launch(const std::wstring& command, const std::wstring& directory) {
     CloseHandle(thread);
     return true;
 }
+
+std::vector<std::wstring> BuildCommands(const std::wstring& raw, const std::vector<std::wstring>& files, const std::wstring& target);
 
 class Handler final : public IContextMenu, public IShellExtInit {
 public:
@@ -469,15 +481,13 @@ public:
         }
     }
     HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
+        Log(L"InvokeCommand verb=" + std::to_wstring(reinterpret_cast<uintptr_t>(info ? info->lpVerb : nullptr)) +
+            L" entries=" + std::to_wstring(entries_.size()));
         if (!info || HIWORD(info->lpVerb) || LOWORD(info->lpVerb) >= entries_.size()) return E_INVALIDARG;
         try {
-            const std::wstring pattern = ExpandEnvironment(entries_[LOWORD(info->lpVerb)].cmdline);
             bool ok = true;
-            if (pattern.find(L"{file}") != std::wstring::npos) {
-                for (const std::wstring& source : sources_) ok &= Launch(Expand(pattern, {source}, destination_), destination_);
-            } else {
-                ok = Launch(Expand(pattern, sources_, destination_), destination_);
-            }
+            for (const std::wstring& command : BuildCommands(entries_[LOWORD(info->lpVerb)].cmdline, sources_, destination_))
+                ok &= Launch(command, destination_);
             return ok ? S_OK : E_FAIL;
         } catch (...) {
             return E_FAIL;
@@ -536,6 +546,60 @@ public:
 private:
     LONG references_ = 1;
 };
+
+// Splits "a|b|c" into parts.
+std::vector<std::wstring> SplitArguments(const std::wstring& text) {
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;) {
+        size_t bar = text.find(L'|', start);
+        parts.push_back(text.substr(start, bar == std::wstring::npos ? bar : bar - start));
+        if (bar == std::wstring::npos) return parts;
+        start = bar + 1;
+    }
+}
+
+// Same pattern handling as InvokeCommand: env expansion, then {file} once per file or {files} once.
+std::vector<std::wstring> BuildCommands(const std::wstring& raw, const std::vector<std::wstring>& files, const std::wstring& target) {
+    const std::wstring pattern = ExpandEnvironment(raw);
+    std::vector<std::wstring> commands;
+    if (pattern.find(L"{file}") != std::wstring::npos) {
+        for (const std::wstring& source : files) commands.push_back(Expand(pattern, {source}, target));
+    } else {
+        commands.push_back(Expand(pattern, files, target));
+    }
+    return commands;
+}
+
+// Exported for testing. Writes the expanded command lines (one per line) to `output`; returns the required length.
+extern "C" int WINAPI EzExpandCommandLine(const wchar_t* pattern, const wchar_t* target, const wchar_t* const* files,
+    int fileCount, wchar_t* output, int capacity) {
+    std::vector<std::wstring> list;
+    for (int i = 0; i < fileCount; ++i) list.push_back(files[i]);
+    std::wstring joined;
+    for (const std::wstring& command : BuildCommands(pattern, list, target)) joined += command + L"\n";
+    if (output && capacity > static_cast<int>(joined.size())) wcscpy_s(output, capacity, joined.c_str());
+    return static_cast<int>(joined.size()) + 1;
+}
+
+// rundll32 handler.dll,ExpandW pattern|targetDir|file1|file2...  (result goes to handler.log)
+extern "C" void CALLBACK ExpandW(HWND, HINSTANCE, LPWSTR arguments, int) {
+    std::vector<std::wstring> parts = SplitArguments(arguments ? arguments : L"");
+    Log(L"Expand: raw arguments: " + std::wstring(arguments ? arguments : L""));
+    if (parts.size() < 3) { Log(L"Expand: expected pattern|targetDir|file1[|file2...]"); return; }
+    for (const std::wstring& command : BuildCommands(parts[0], std::vector<std::wstring>(parts.begin() + 2, parts.end()), parts[1]))
+        Log(L"Expand: " + command);
+}
+
+// Same arguments as ExpandW, but also runs each expanded command synchronously.
+extern "C" void CALLBACK RunW(HWND, HINSTANCE, LPWSTR arguments, int) {
+    std::vector<std::wstring> parts = SplitArguments(arguments ? arguments : L"");
+    if (parts.size() < 3) { Log(L"Run: expected pattern|targetDir|file1[|file2...]"); return; }
+    for (const std::wstring& command : BuildCommands(parts[0], std::vector<std::wstring>(parts.begin() + 2, parts.end()), parts[1])) {
+        Log(L"Run: " + command);
+        Log(L"Run: exit code " + std::to_wstring(ExecuteCommand(command, parts[1])));
+    }
+}
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) { g_instance = instance; DisableThreadLibraryCalls(instance); }
