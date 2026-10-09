@@ -24,8 +24,8 @@ This is a supported way to append a command to the existing Move here / Copy her
 9. **Registry keys:**
    - `HKCU\\Software\\Classes\\CLSID\\{CLSID}` default display name.
    - `HKCU\\Software\\Classes\\CLSID\\{CLSID}\\InProcServer32` default path to the native DLL and `ThreadingModel=Apartment`.
-   - `HKCU\\Software\\Classes\\Directory\\shellex\\DragDropHandlers\\SymbolicLinkExplorerContextMenu` default `{CLSID}`.
-   - `HKCU\\Software\\Classes\\Folder\\shellex\\DragDropHandlers\\SymbolicLinkExplorerContextMenu` default `{CLSID}` as a compatibility registration for Shell folder types.
+   - `HKCU\\Software\\Classes\\Directory\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}`.
+   - `HKCU\\Software\\Classes\\Folder\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}` as a compatibility registration for Shell folder types.
 10. **Registration scope:** HKCU's `Software\\Classes` merge is sufficient for a per-user installation. The DLL is 64-bit and is registered in the 64-bit user Shell view. No machine-wide elevation is required.
 
 ## Architecture
@@ -34,16 +34,12 @@ This is a supported way to append a command to the existing Move here / Copy her
 Explorer.exe (64-bit)
   -> native COM DLL, Apartment, minimal IContextMenu/IShellExtInit
        -> extracts CF_HDROP paths and destination PIDL
-       -> appends "Create symbolic links here"
-       -> on InvokeCommand starts worker with a UTF-16 JSON request
-
-isolated Python worker process
-  -> validates paths and destination
-  -> calls osTools.ln(source, destination / source.name)
-  -> writes diagnostics/logs outside Explorer
+       -> reads %LOCALAPPDATA%\ezExplorerFileDropMenu\menu.json on each menu display
+       -> appends one menu item (name + icon) per entry
+       -> on InvokeCommand expands tokens and starts the command with CreateProcessW
 ```
 
-The native DLL never imports Python and never performs link creation. `InvokeCommand` only serializes the already-captured paths and starts the worker, so failures are contained outside Explorer and the Shell callback remains lightweight.
+The native DLL never loads a scripting runtime and performs no file operations itself. `InvokeCommand` only expands the entry's command line and starts a child process, so work happens outside Explorer.
 
 ## COM interfaces
 
@@ -51,7 +47,7 @@ The native class implements:
 
 - `IUnknown`: lifetime and interface discovery.
 - `IShellExtInit`: receives the destination PIDL and dragged `IDataObject`.
-- `IContextMenu`: contributes one command and starts the worker.
+- `IContextMenu`: contributes one command per `menu.json` entry and launches its command line.
 
 `IDataObject` is queried for `CF_HDROP` with `TYMED_HGLOBAL`. This project intentionally supports filesystem items represented by `CF_HDROP`: files, directories, mixed selections, spaces, Unicode, and multiple items. Namespace-only Shell items without filesystem paths are rejected with a diagnostic rather than guessed. `ReleaseStgMedium` releases the acquired storage medium.
 
@@ -59,9 +55,15 @@ The native class implements:
 
 ## Action semantics
 
-For each dragged source `S`, the worker calls the existing `osTools.ln(S, D / S.name)`, where `D` is the destination directory supplied by Explorer. Existing non-symlink destinations fail rather than being overwritten. Existing symlinks follow `osTools.ln()` behavior. The operation is best-effort per item and records every success/failure in the log. No files are moved or copied.
+`menu.json` is an array of `{"name", "icon", "cmdline"}` objects; each becomes a menu entry in array order. `icon` is optional and may be an `.ico` path or `path,index` for an exe/dll; environment variables are expanded in `icon` and `cmdline`.
 
-The worker receives a JSON file in a per-user application data directory rather than untrusted command-line path concatenation. The native shim passes only a fixed worker executable path and a generated request filename using `CreateProcessW` with a correctly quoted command line.
+- `{file}` in `cmdline`: the command is started once per dragged item.
+- `{files}`: the command is started once with all items, separated by spaces.
+- `{targetDir}`: the drop destination folder.
+
+Each substituted path is quoted per `CommandLineToArgvW` rules, so do not add quotes around a token; if a token is already inside quotes in the template, it is inserted escaped without extra quotes. Commands run through `CreateProcessW` (no implicit shell; use `cmd /c` for built-ins) with `targetDir` as working directory and no console window. Command lines of 32,767 characters or more are refused. Failures to parse the file or start a process are logged to `logs\handler.log`.
+
+The configuration is an arbitrary-command launcher, so it lives in the per-user profile and should only be writable by that user.
 
 ## Registration and notification
 
@@ -71,11 +73,11 @@ The 64-bit DLL must be loaded by 64-bit Explorer. A 32-bit build would be invisi
 
 ## Threading and containment
 
-The CLSID is registered with `ThreadingModel=Apartment`, matching Microsoft's Shell extension registration guidance. COM methods return HRESULTs and contain native exceptions. `QueryContextMenu` does no filesystem traversal. `InvokeCommand` copies the captured values, starts the worker, and returns. The worker catches per-item failures and logs to `%LOCALAPPDATA%\\SymbolicLinkExplorerContextMenu\\logs`.
+The CLSID is registered with `ThreadingModel=Apartment`, matching Microsoft's Shell extension registration guidance. COM methods return HRESULTs and contain native exceptions. `QueryContextMenu` does no filesystem traversal. `QueryContextMenu` reads only the small `menu.json`. `InvokeCommand` starts the child processes and returns; failures are logged to `%LOCALAPPDATA%\\ezExplorerFileDropMenu\\logs`.
 
 ## Installation lifecycle
 
-`install.ps1` validates 64-bit Windows and Python/dependencies, builds or locates the native DLL and worker, copies production files below `%LOCALAPPDATA%\\SymbolicLinkExplorerContextMenu`, writes HKCU registration, calls Shell notification, and prints the registry and artifact paths. It is idempotent. `uninstall.ps1` removes the owned registration and installation directory after a best-effort Shell notification. `diagnostics.ps1` and `python -m symbolic_link_explorer_context_menu diagnostics` are read-only.
+`install.ps1` validates 64-bit Windows, copies the DLL below `%LOCALAPPDATA%\\ezExplorerFileDropMenu`, seeds `menu.json` from `menu.sample.json` only if absent, writes HKCU registration, and calls Shell notification. It is idempotent. `uninstall.ps1` removes the owned registration and installed files but keeps the user's `menu.json`. `diagnostics.ps1` is read-only.
 
 ## Alternatives considered
 

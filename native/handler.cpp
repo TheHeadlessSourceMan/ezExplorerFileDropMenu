@@ -4,44 +4,22 @@
 #include <shobjidl.h>
 #include <objidl.h>
 #include <shlwapi.h>
+#include <cstring>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <filesystem>
 
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 
-const CLSID CLSID_SymbolicLinkExplorerContextMenu = {0x6d4d8ef0, 0x3e69, 0x4f5d, {0x8d, 0x5a, 0x1f, 0x8c, 0xb0, 0xf2, 0xb9, 0xc4}};
+const CLSID CLSID_ezExplorerFileDropMenu = {0x6d4d8ef0, 0x3e69, 0x4f5d, {0x8d, 0x5a, 0x1f, 0x8c, 0xb0, 0xf2, 0xb9, 0xc4}};
 HINSTANCE g_instance = nullptr;
 long g_objects = 0;
 long g_locks = 0;
-constexpr UINT kCommand = 1;
-
-std::string ToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(size, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
-    return result;
-}
-
-std::string JsonString(const std::wstring& value) {
-    std::string result = "\"";
-    for (unsigned char character : ToUtf8(value)) {
-        switch (character) {
-        case '\\': result += "\\\\"; break;
-        case '"': result += "\\\""; break;
-        case '\n': result += "\\n"; break;
-        case '\r': result += "\\r"; break;
-        case '\t': result += "\\t"; break;
-        default: result += static_cast<char>(character); break;
-        }
-    }
-    result += "\"";
-    return result;
-}
+constexpr size_t kMaxCommandLine = 32767;
 
 std::wstring InstallDirectory() {
     wchar_t* app_data = nullptr;
@@ -49,35 +27,296 @@ std::wstring InstallDirectory() {
     _wdupenv_s(&app_data, &length, L"LOCALAPPDATA");
     std::wstring result = app_data ? app_data : L".";
     free(app_data);
-    return result + L"\\SymbolicLinkExplorerContextMenu";
+    return result + L"\\ezExplorerFileDropMenu";
 }
 
-bool WriteRequest(const std::vector<std::wstring>& sources, const std::wstring& destination, std::wstring& request_path) {
-    wchar_t temporary[MAX_PATH] = {};
-    if (GetTempPathW(MAX_PATH, temporary) == 0 || GetTempFileNameW(temporary, L"slx", 0, temporary) == 0) return false;
-    request_path = temporary;
-    std::ofstream output(std::filesystem::path(request_path), std::ios::binary | std::ios::trunc);
-    if (!output) return false;
-    output << "{\"sources\":[";
-    for (size_t index = 0; index < sources.size(); ++index) {
-        if (index) output << ',';
-        output << JsonString(sources[index]);
+void Log(const std::wstring& message) {
+    try {
+        std::wstring directory = InstallDirectory() + L"\\logs";
+        std::filesystem::create_directories(directory);
+        int size = WideCharToMultiByte(CP_UTF8, 0, message.data(), static_cast<int>(message.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(size, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, message.data(), static_cast<int>(message.size()), utf8.data(), size, nullptr, nullptr);
+        std::ofstream output(std::filesystem::path(directory + L"\\handler.log"), std::ios::binary | std::ios::app);
+        output << utf8 << "\n";
+    } catch (...) {
     }
-    output << "],\"destination\":" << JsonString(destination) << ",\"key_state\":0}\n";
-    return output.good();
 }
 
-bool StartWorker(const std::wstring& request_path) {
-    std::wstring worker = InstallDirectory() + L"\\worker.exe";
-    std::wstring log = InstallDirectory() + L"\\logs\\worker.log";
-    std::wstring command = L"\"" + worker + L"\" \"" + request_path + L"\" --log \"" + log + L"\"";
+std::wstring ExpandEnvironment(const std::wstring& value) {
+    DWORD size = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
+    if (!size) return value;
+    std::wstring result(size, L'\0');
+    ExpandEnvironmentStringsW(value.c_str(), result.data(), size);
+    result.resize(size - 1);
+    return result;
+}
+
+struct Entry {
+    std::wstring name;
+    std::wstring icon;
+    std::wstring cmdline;
+    HBITMAP bitmap = nullptr;
+};
+
+void AppendUtf8(std::string& out, unsigned long code) {
+    if (code < 0x80) out += static_cast<char>(code);
+    else if (code < 0x800) { out += static_cast<char>(0xC0 | (code >> 6)); out += static_cast<char>(0x80 | (code & 0x3F)); }
+    else if (code < 0x10000) {
+        out += static_cast<char>(0xE0 | (code >> 12)); out += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (code & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (code >> 18)); out += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((code >> 6) & 0x3F)); out += static_cast<char>(0x80 | (code & 0x3F));
+    }
+}
+
+// Minimal reader for an array of flat objects whose interesting values are strings.
+class JsonReader {
+public:
+    explicit JsonReader(const std::string& text) : text_(text) {}
+
+    bool ReadEntries(std::vector<Entry>& entries) {
+        SkipWhitespace();
+        if (Peek() == '{') { Entry entry; if (!ReadObject(entry)) return false; entries.push_back(entry); return true; }
+        if (!Consume('[')) return false;
+        SkipWhitespace();
+        if (Consume(']')) return true;
+        for (;;) {
+            Entry entry;
+            if (!ReadObject(entry)) return false;
+            entries.push_back(entry);
+            SkipWhitespace();
+            if (Consume(',')) continue;
+            return Consume(']');
+        }
+    }
+
+private:
+    const std::string& text_;
+    size_t position_ = 0;
+
+    char Peek() const { return position_ < text_.size() ? text_[position_] : '\0'; }
+    void SkipWhitespace() { while (position_ < text_.size() && strchr(" \t\r\n", text_[position_])) ++position_; }
+    bool Consume(char expected) {
+        SkipWhitespace();
+        if (Peek() != expected) return false;
+        ++position_;
+        return true;
+    }
+
+    bool ReadHex4(unsigned long& value) {
+        if (position_ + 4 > text_.size()) return false;
+        value = 0;
+        for (int i = 0; i < 4; ++i) {
+            char c = text_[position_++];
+            value <<= 4;
+            if (c >= '0' && c <= '9') value |= c - '0';
+            else if (c >= 'a' && c <= 'f') value |= c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') value |= c - 'A' + 10;
+            else return false;
+        }
+        return true;
+    }
+
+    bool ReadString(std::wstring& result) {
+        if (!Consume('"')) return false;
+        std::string utf8;
+        while (position_ < text_.size()) {
+            char c = text_[position_++];
+            if (c == '"') {
+                int size = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+                result.assign(size, L'\0');
+                if (size) MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), result.data(), size);
+                return true;
+            }
+            if (c != '\\') { utf8 += c; continue; }
+            if (position_ >= text_.size()) return false;
+            char escape = text_[position_++];
+            switch (escape) {
+            case 'n': utf8 += '\n'; break;
+            case 'r': utf8 += '\r'; break;
+            case 't': utf8 += '\t'; break;
+            case 'b': utf8 += '\b'; break;
+            case 'f': utf8 += '\f'; break;
+            case 'u': {
+                unsigned long code = 0;
+                if (!ReadHex4(code)) return false;
+                if (code >= 0xD800 && code < 0xDC00) {
+                    unsigned long low = 0;
+                    if (text_.compare(position_, 2, "\\u") == 0) {
+                        position_ += 2;
+                        if (!ReadHex4(low)) return false;
+                    }
+                    code = (low >= 0xDC00 && low < 0xE000) ? 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00) : 0xFFFD;
+                } else if (code >= 0xDC00 && code < 0xE000) {
+                    code = 0xFFFD;
+                }
+                AppendUtf8(utf8, code);
+                break;
+            }
+            default: utf8 += escape; break;
+            }
+        }
+        return false;
+    }
+
+    bool SkipValue() {
+        SkipWhitespace();
+        if (Peek() == '"') { std::wstring ignored; return ReadString(ignored); }
+        if (Peek() == '{' || Peek() == '[') {
+            int depth = 0;
+            while (position_ < text_.size()) {
+                char c = text_[position_];
+                if (c == '"') { std::wstring ignored; if (!ReadString(ignored)) return false; continue; }
+                ++position_;
+                if (c == '{' || c == '[') ++depth;
+                else if ((c == '}' || c == ']') && --depth == 0) return true;
+            }
+            return false;
+        }
+        while (position_ < text_.size() && !strchr(",}] \t\r\n", text_[position_])) ++position_;
+        return true;
+    }
+
+    bool ReadObject(Entry& entry) {
+        if (!Consume('{')) return false;
+        SkipWhitespace();
+        if (Consume('}')) return true;
+        for (;;) {
+            std::wstring key;
+            if (!ReadString(key) || !Consume(':')) return false;
+            SkipWhitespace();
+            std::wstring* target = key == L"name" ? &entry.name : key == L"icon" ? &entry.icon : key == L"cmdline" ? &entry.cmdline : nullptr;
+            if (target && Peek() == '"') { if (!ReadString(*target)) return false; }
+            else if (!SkipValue()) return false;
+            if (Consume(',')) continue;
+            return Consume('}');
+        }
+    }
+};
+
+bool LoadEntries(std::vector<Entry>& entries) {
+    std::ifstream input(std::filesystem::path(InstallDirectory() + L"\\menu.json"), std::ios::binary);
+    if (!input) return false;
+    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) text.erase(0, 3);
+    std::vector<Entry> parsed;
+    if (!JsonReader(text).ReadEntries(parsed)) {
+        Log(L"menu.json is not valid; expected an array of {name, icon, cmdline} objects");
+        return false;
+    }
+    for (Entry& entry : parsed) {
+        if (!entry.name.empty() && !entry.cmdline.empty()) entries.push_back(entry);
+    }
+    return true;
+}
+
+HBITMAP LoadMenuBitmap(const std::wstring& spec) {
+    if (spec.empty()) return nullptr;
+    int size = GetSystemMetrics(SM_CXSMICON);
+    std::wstring path = ExpandEnvironment(spec);
+    int index = 0;
+    size_t comma = path.rfind(L',');
+    if (comma != std::wstring::npos) {
+        index = _wtoi(path.c_str() + comma + 1);
+        path.resize(comma);
+    }
+    HICON icon = nullptr;
+    if (_wcsicmp(PathFindExtensionW(path.c_str()), L".ico") == 0) {
+        icon = static_cast<HICON>(LoadImageW(nullptr, path.c_str(), IMAGE_ICON, size, size, LR_LOADFROMFILE));
+    } else {
+        ExtractIconExW(path.c_str(), index, nullptr, &icon, 1);
+    }
+    if (!icon) return nullptr;
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HDC context = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap) {
+        HGDIOBJ previous = SelectObject(context, bitmap);
+        DrawIconEx(context, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL);
+        SelectObject(context, previous);
+    }
+    DeleteDC(context);
+    ReleaseDC(nullptr, screen);
+    DestroyIcon(icon);
+    return bitmap;
+}
+
+// Follows CommandLineToArgvW rules so each substituted path stays one argument.
+std::wstring EscapePath(const std::wstring& value, bool wrap, bool closingQuoteFollows) {
+    std::wstring result = wrap ? L"\"" : L"";
+    size_t backslashes = 0;
+    for (wchar_t c : value) {
+        if (c == L'\\') { ++backslashes; continue; }
+        if (c == L'"') { result.append(backslashes * 2 + 1, L'\\'); backslashes = 0; result += L'"'; continue; }
+        result.append(backslashes, L'\\');
+        backslashes = 0;
+        result += c;
+    }
+    result.append(wrap || closingQuoteFollows ? backslashes * 2 : backslashes, L'\\');
+    if (wrap) result += L'"';
+    return result;
+}
+
+std::wstring Expand(const std::wstring& pattern, const std::vector<std::wstring>& files, const std::wstring& target) {
+    static const wchar_t* kFile = L"{file}";
+    static const wchar_t* kFiles = L"{files}";
+    static const wchar_t* kTarget = L"{targetDir}";
+    std::wstring result;
+    bool in_quotes = false;
+    size_t backslashes = 0;
+    for (size_t i = 0; i < pattern.size();) {
+        wchar_t c = pattern[i];
+        const wchar_t* token = nullptr;
+        if (c == L'{') {
+            for (const wchar_t* candidate : {kFile, kFiles, kTarget}) {
+                if (pattern.compare(i, wcslen(candidate), candidate) == 0) { token = candidate; break; }
+            }
+        }
+        if (!token) {
+            if (c == L'"' && backslashes % 2 == 0) in_quotes = !in_quotes;
+            backslashes = c == L'\\' ? backslashes + 1 : 0;
+            result += c;
+            ++i;
+            continue;
+        }
+        i += wcslen(token);
+        bool closing = i < pattern.size() && pattern[i] == L'"';
+        std::vector<std::wstring> values;
+        if (token == kTarget) values.push_back(target);
+        else values = files;
+        for (size_t index = 0; index < values.size(); ++index) {
+            if (index) result += L' ';
+            result += EscapePath(values[index], !in_quotes, closing);
+        }
+        backslashes = 0;
+    }
+    return result;
+}
+
+bool Launch(std::wstring command, const std::wstring& directory) {
+    if (command.size() >= kMaxCommandLine) {
+        Log(L"command line too long (" + std::to_wstring(command.size()) + L" characters): " + command.substr(0, 200));
+        return false;
+    }
     STARTUPINFOW startup = {sizeof(startup)};
     PROCESS_INFORMATION process = {};
-    std::vector<wchar_t> command_buffer(command.begin(), command.end());
-    command_buffer.push_back(L'\0');
-    BOOL started = CreateProcessW(worker.c_str(), command_buffer.data(), nullptr, nullptr, FALSE,
-        CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, InstallDirectory().c_str(), &startup, &process);
-    if (!started) return false;
+    command.push_back(L'\0');
+    BOOL started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+        directory.empty() ? nullptr : directory.c_str(), &startup, &process);
+    if (!started) {
+        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + command);
+        return false;
+    }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return true;
@@ -86,7 +325,10 @@ bool StartWorker(const std::wstring& request_path) {
 class Handler final : public IContextMenu, public IShellExtInit {
 public:
     Handler() { ++g_objects; }
-    ~Handler() { --g_objects; }
+    ~Handler() {
+        ClearEntries();
+        --g_objects;
+    }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
         if (!result) return E_POINTER;
         *result = nullptr;
@@ -124,34 +366,63 @@ public:
         ReleaseStgMedium(&medium);
         return sources_.empty() ? DV_E_FORMATETC : S_OK;
     }
-    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu, UINT index, UINT first, UINT, UINT flags) override {
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU menu, UINT index, UINT first, UINT last, UINT flags) override {
         if (flags & CMF_DEFAULTONLY) return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
-        InsertMenuW(menu, index++, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
-        InsertMenuW(menu, index, MF_BYPOSITION | MF_STRING, first + kCommand, L"Create symbolic links here");
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, kCommand + 1);
-    }
-    HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
-        if (!info || HIWORD(info->lpVerb) || LOWORD(info->lpVerb) != kCommand) return E_INVALIDARG;
         try {
-            std::wstring request;
-            if (!WriteRequest(sources_, destination_, request)) return E_FAIL;
-            return StartWorker(request) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+            ClearEntries();
+            if (!LoadEntries(entries_) || entries_.empty()) return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+            UINT available = last >= first ? last - first + 1 : 0;
+            if (entries_.size() > available) entries_.resize(available);
+            InsertMenuW(menu, index++, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                Entry& entry = entries_[i];
+                entry.bitmap = LoadMenuBitmap(entry.icon);
+                MENUITEMINFOW item = {sizeof(item)};
+                item.fMask = MIIM_ID | MIIM_STRING | MIIM_FTYPE;
+                item.fType = MFT_STRING;
+                item.wID = first + static_cast<UINT>(i);
+                item.dwTypeData = entry.name.data();
+                if (entry.bitmap) { item.fMask |= MIIM_BITMAP; item.hbmpItem = entry.bitmap; }
+                InsertMenuItemW(menu, index++, TRUE, &item);
+            }
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, static_cast<USHORT>(entries_.size()));
         } catch (...) {
             return E_FAIL;
         }
     }
-    HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR, UINT flags, UINT*, LPSTR buffer, UINT length) override {
+    HRESULT STDMETHODCALLTYPE InvokeCommand(LPCMINVOKECOMMANDINFO info) override {
+        if (!info || HIWORD(info->lpVerb) || LOWORD(info->lpVerb) >= entries_.size()) return E_INVALIDARG;
+        try {
+            const std::wstring pattern = ExpandEnvironment(entries_[LOWORD(info->lpVerb)].cmdline);
+            bool ok = true;
+            if (pattern.find(L"{file}") != std::wstring::npos) {
+                for (const std::wstring& source : sources_) ok &= Launch(Expand(pattern, {source}, destination_), destination_);
+            } else {
+                ok = Launch(Expand(pattern, sources_, destination_), destination_);
+            }
+            return ok ? S_OK : E_FAIL;
+        } catch (...) {
+            return E_FAIL;
+        }
+    }
+    HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR id, UINT flags, UINT*, LPSTR buffer, UINT length) override {
         if (!buffer || !length) return E_INVALIDARG;
         if (flags == GCS_VERBA) {
-            lstrcpynA(buffer, "create_symbolic_links", static_cast<int>(length));
+            std::string verb = "slx_" + std::to_string(id);
+            lstrcpynA(buffer, verb.c_str(), static_cast<int>(length));
             return S_OK;
         }
         return E_NOTIMPL;
     }
 private:
+    void ClearEntries() {
+        for (Entry& entry : entries_) if (entry.bitmap) DeleteObject(entry.bitmap);
+        entries_.clear();
+    }
     LONG references_ = 1;
     std::wstring destination_;
     std::vector<std::wstring> sources_;
+    std::vector<Entry> entries_;
 };
 
 class Factory final : public IClassFactory {
@@ -198,7 +469,7 @@ STDAPI DllCanUnloadNow() {
 }
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void** result) {
-    if (clsid != CLSID_SymbolicLinkExplorerContextMenu) return CLASS_E_CLASSNOTAVAILABLE;
+    if (clsid != CLSID_ezExplorerFileDropMenu) return CLASS_E_CLASSNOTAVAILABLE;
     Factory* factory = new (std::nothrow) Factory();
     if (!factory) return E_OUTOFMEMORY;
     HRESULT status = factory->QueryInterface(iid, result);

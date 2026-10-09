@@ -1,0 +1,12 @@
+﻿[
+  {
+    "name": "Create symbolic links here",
+    "icon": "%SystemRoot%\\System32\\shell32.dll,29",
+    "cmdline": "powershell -NoProfile -Command \"$f='{file}'; New-Item -ItemType SymbolicLink -Path (Join-Path '{targetDir}' (Split-Path -Leaf $f)) -Target $f\""
+  },
+  {
+    "name": "List dropped items",
+    "icon": "%SystemRoot%\\System32\\cmd.exe,0",
+    "cmdline": "cmd /k echo {files}"
+  }
+]

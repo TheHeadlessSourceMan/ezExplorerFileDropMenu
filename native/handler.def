@@ -1,4 +1,4 @@
-LIBRARY SymbolicLinkExplorerContextMenu
+LIBRARY ezExplorerFileDropMenu
 EXPORTS
     DllCanUnloadNow
     DllGetClassObject
