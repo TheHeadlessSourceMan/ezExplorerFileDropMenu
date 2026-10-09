@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 $clsid = "{6d4d8ef0-3e69-4f5d-8d5a-1f8cb0f2b9c4}"
-foreach ($kind in @('Directory','Folder')) {
+foreach ($kind in @('Directory','Folder','Directory\Background','Drive')) {
     Remove-Item "HKCU:\Software\Classes\$kind\shellex\DragDropHandlers\ezExplorerFileDropMenu" -Recurse -Force -ErrorAction SilentlyContinue
 }
 Remove-Item "HKCU:\Software\Classes\CLSID\$clsid" -Recurse -Force -ErrorAction SilentlyContinue

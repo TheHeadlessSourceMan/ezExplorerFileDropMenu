@@ -26,6 +26,10 @@ This is a supported way to append a command to the existing Move here / Copy her
    - `HKCU\\Software\\Classes\\CLSID\\{CLSID}\\InProcServer32` default path to the native DLL and `ThreadingModel=Apartment`.
    - `HKCU\\Software\\Classes\\Directory\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}`.
    - `HKCU\\Software\\Classes\\Folder\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}` as a compatibility registration for Shell folder types.
+   - `HKCU\\Software\\Classes\\Directory\\Background\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}` for drops onto the empty background of an open folder window.
+   - `HKCU\\Software\\Classes\\Drive\\shellex\\DragDropHandlers\\ezExplorerFileDropMenu` default `{CLSID}` for drops onto a drive such as `C:\`.
+
+   Microsoft's predefined-object table lists `Directory` (file folders), `Folder` (all folders), `Directory\\Background` (folder background) and `Drive` (drives) as separate registration targets; the drag-and-drop page only shows `Directory`. Third-party drag-and-drop handlers (for example TortoiseSVN) register under all four, so each drop target is covered.
 10. **Registration scope:** HKCU's `Software\\Classes` merge is sufficient for a per-user installation. The DLL is 64-bit and is registered in the 64-bit user Shell view. No machine-wide elevation is required.
 
 ## Architecture

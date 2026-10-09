@@ -18,7 +18,7 @@ $inproc = Join-Path $base 'InProcServer32'
 New-Item $inproc -Force | Out-Null
 Set-ItemProperty $inproc -Name '(default)' -Value (Join-Path $install 'ezExplorerFileDropMenu.dll')
 Set-ItemProperty $inproc -Name ThreadingModel -Value Apartment
-foreach ($kind in @('Directory','Folder')) {
+foreach ($kind in @('Directory','Folder','Directory\Background','Drive')) {
     $key = "HKCU:\Software\Classes\$kind\shellex\DragDropHandlers\ezExplorerFileDropMenu"
     New-Item $key -Force | Out-Null
     Set-ItemProperty $key -Name '(default)' -Value $clsid

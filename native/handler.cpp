@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cwchar>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -351,14 +352,41 @@ struct Job {
 };
 
 // Synchronous; returns the process exit code, or -1 if it could not be started.
+// Overwrites logs\lastcommand.log with the command line, its stdout/stderr and the exit code.
 int ExecuteCommand(const std::wstring& command, const std::wstring& directory) {
+    static std::mutex serialize;  // keeps lastcommand.log coherent when several jobs start at once
+    std::lock_guard<std::mutex> lock(serialize);
     Log(L"executing: " + command + L" (cwd: " + directory + L")");
+    HANDLE output = INVALID_HANDLE_VALUE;
+    try {
+        std::wstring logs = InstallDirectory() + L"\\logs";
+        std::filesystem::create_directories(logs);
+        SECURITY_ATTRIBUTES inherit = {sizeof(inherit), nullptr, TRUE};
+        output = CreateFileW((logs + L"\\lastcommand.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+    } catch (...) {
+    }
+    auto write = [&](const std::wstring& text) {
+        if (output == INVALID_HANDLE_VALUE) return;
+        int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(size, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(), size, nullptr, nullptr);
+        DWORD written = 0;
+        WriteFile(output, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    };
+    write(L"cmdline: " + command + L"\r\ncwd: " + directory + L"\r\n--- output ---\r\n");
     std::wstring mutable_command = command;
     mutable_command.push_back(L'\0');
     STARTUPINFOW startup = {sizeof(startup)};
+    if (output != INVALID_HANDLE_VALUE) {
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdOutput = output;
+        startup.hStdError = output;
+        startup.hStdInput = INVALID_HANDLE_VALUE;
+    }
     PROCESS_INFORMATION process = {};
-    BOOL started = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-        directory.empty() ? nullptr : directory.c_str(), &startup, &process);
+    BOOL started = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, output != INVALID_HANDLE_VALUE,
+        CREATE_NO_WINDOW, nullptr, directory.empty() ? nullptr : directory.c_str(), &startup, &process);
     int result = -1;
     if (started) {
         CloseHandle(process.hThread);
@@ -368,15 +396,21 @@ int ExecuteCommand(const std::wstring& command, const std::wstring& directory) {
         CloseHandle(process.hProcess);
         result = static_cast<int>(code);
         Log(L"command exited with " + std::to_wstring(code));
+        write(L"\r\n--- exit code " + std::to_wstring(code) + L" ---\r\n");
         if (code != 0 && !IsElevated()) {
             Log(L"retrying elevated: " + command);
+            write(L"retrying elevated (output not captured)\r\n");
             RunElevated(command, directory);
         }
     } else if (GetLastError() == ERROR_ELEVATION_REQUIRED) {
+        write(L"\r\n--- elevation required; launching elevated (output not captured) ---\r\n");
         RunElevated(command, directory);
     } else {
-        Log(L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + command);
+        std::wstring failure = L"CreateProcess failed (" + std::to_wstring(GetLastError()) + L"): " + command;
+        Log(failure);
+        write(L"\r\n--- " + failure + L" ---\r\n");
     }
+    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
     return result;
 }
 

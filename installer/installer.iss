@@ -32,3 +32,5 @@ Root: HKCU; Subkey: "Software\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType:
 Root: HKCU; Subkey: "Software\Classes\CLSID\{#Clsid}\InProcServer32"; ValueType: string; ValueName: "ThreadingModel"; ValueData: "Apartment"
 Root: HKCU; Subkey: "Software\Classes\Directory\shellex\DragDropHandlers\ezExplorerFileDropMenu"; ValueType: string; ValueData: "{#Clsid}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Folder\shellex\DragDropHandlers\ezExplorerFileDropMenu"; ValueType: string; ValueData: "{#Clsid}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shellex\DragDropHandlers\ezExplorerFileDropMenu"; ValueType: string; ValueData: "{#Clsid}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Drive\shellex\DragDropHandlers\ezExplorerFileDropMenu"; ValueType: string; ValueData: "{#Clsid}"; Flags: uninsdeletekey

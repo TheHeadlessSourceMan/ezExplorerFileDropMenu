@@ -60,7 +60,7 @@ Use the complete workflow in [docs/manual-testing.md](docs/manual-testing.md). E
 
 ## Diagnostics and logging
 
-Diagnostics are read-only (`scripts\diagnostics.ps1`). Invalid `menu.json` content and process start failures are logged to `%LOCALAPPDATA%\ezExplorerFileDropMenu\logs\handler.log`. Output of the launched commands is not captured.
+Diagnostics are read-only (`scripts\diagnostics.ps1`). Invalid `menu.json` content and process start failures are logged to `%LOCALAPPDATA%\ezExplorerFileDropMenu\logs\handler.log`. Output of the launched commands is not captured in `handler.log`; instead `logs\lastcommand.log` holds the command line, working directory, combined stdout/stderr and exit code of the most recently run command (overwritten on each run; elevated retries are not captured).
 
 ## Uninstall and upgrade
 
